@@ -1,0 +1,4 @@
+Flask>=1.11
+peewee
+pytest
+pytest-flask
