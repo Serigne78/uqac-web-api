@@ -1,9 +1,13 @@
 # models.py
 
+<<<<<<< HEAD
 from peewee import (
     Model, SqliteDatabase, IntegerField, CharField,
     BooleanField, FloatField, ForeignKeyField, TextField
 )
+=======
+from peewee import Model, SqliteDatabase, IntegerField, CharField, BooleanField, FloatField, ForeignKeyField
+>>>>>>> main
 
 # Base de données SQLite (fichier local inf349.db)
 DATABASE = SqliteDatabase('inf349.db')
@@ -36,6 +40,7 @@ class Product(BaseModel):
     class Meta:
         table_name = 'products'
 
+<<<<<<< HEAD
 
 class Order(BaseModel):
     """
@@ -79,3 +84,17 @@ class Order(BaseModel):
 
     class Meta:
         table_name = 'orders'
+=======
+class Order(BaseModel):
+    """
+    Représente une commande, qui ne peut contenir qu'un seul produit.
+    - id       : identifiant auto-incrémenté (clé primaire)
+    - product  : clé étrangère vers Product
+    - quantity : quantité commandée (int >= 1)
+    """
+    product = ForeignKeyField(Product, backref='orders', on_delete='CASCADE')
+    quantity = IntegerField()
+
+    class Meta:
+        table_name = 'orders'
+>>>>>>> main
