@@ -13,6 +13,8 @@ app = Flask(__name__)
 
 # URL du service distant pour charger les produits au démarrage
 REMOTE_URL = "http://dimensweb.uqac.ca/~jgnault/shops/products/products.json"
+# URL du service distant de paiement
+REMOTE_PAY_URL = "https://dimensweb.uqac.ca/~jgnault/shops/pay/"
 
 # Taux de taxe par défaut (utilisé à la création de l’ordre, province inconnue)
 TAX_DEFAULT = 0.15  # 15% (QC par défaut)
@@ -316,197 +318,245 @@ def get_order(order_id):
 
 
 @app.route('/order/<int:order_id>', methods=['PUT'])
-def update_order(order_id):
+def update_or_pay_order(order_id):
     """
     PUT /order/<order_id>
-    Body attendu (JSON) :
-    {
-      "order": {
-         "email": <string>,
-         "shipping_information": {
-            "country"    : <string>,
-            "address"    : <string>,
-            "postal_code": <string>,
-            "city"       : <string>,
-            "province"   : <string>  # QC, ON, AB, BC ou NS
+
+    Deux cas selon la forme du JSON reçu :
+
+    1) Mise à jour des infos client :
+       On reçoit un JSON de la forme :
+       {
+         "order": {
+           "email": "...",
+           "shipping_information": {
+             "country": "...",
+             "address": "...",
+             "postal_code": "...",
+             "city": "...",
+             "province": "..."
+           }
          }
-      }
-    }
+       }
+       -> On met à jour email + shipping_*.
+       -> Si un champ manque, 422 missing-fields.
+       -> Si order.paid == True, 422 already-paid.
 
-    Exigences :
-     1. Si la commande n'existe pas → 404
-     2. Les champs "email" ET "shipping_information" (avec ses 5 sous-champs) sont tous obligatoires.
-     3. Tout autre champ (total_price, total_price_tax, product, shipping_price, id, paid, credit_card, transaction) ne peut pas être modifié ici.
-     4. Calculer le nouveau total_price_tax en fonction de la province fournie.
-     5. Retourner 200 OK + JSON avec l’ordre mis à jour.
+    2) Paiement par carte :
+       On reçoit un JSON de la forme :
+       {
+         "credit_card": {
+           "name": "...",
+           "number": "...",
+           "expiration_year": 2024,
+           "cvv": "...",
+           "expiration_month": 9
+         }
+       }
+       -> Si email ou shipping_* de la commande sont manquants en DB, 422 missing-fields.
+       -> Si order.paid == True, 422 already-paid.
+       -> Sinon, on envoie au service de paiement distant :
+          {
+            "credit_card": { … },
+            "amount_charged": total_price_tax + shipping_price
+          }
+         • Si distant renvoie 422, on renvoie 422 + corps tel quel.
+         • Si 200, on met à jour order.credit_card, order.transaction, order.paid=True, order.save()
+           puis on renvoie 200 + JSON complet de la commande.
+         • Sinon, 502 service-error.
+
+    Tout autre cas (ni "order", ni "credit_card") -> 422 missing-fields.
     """
-    # 1) Vérifier que l'ordre existe
-    try:
-        order = Order.get(Order.id == order_id)
-    except Order.DoesNotExist:
-        return make_response(jsonify({
-            "errors": {
-                "order": {
-                    "code": "not-found",
-                    "name": f"La commande d'ID {order_id} n'existe pas"
-                }
+    order = Order.get_or_none(Order.id == order_id)
+    if order is None:
+        return jsonify({"error": "Order not found"}), 404
+
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return _error_missing_fields_order("Corps JSON invalide ou manquant")
+
+    # Cas 1 : mise à jour des infos client
+    if "order" in data:
+        payload = data["order"]
+        has_email = "email" in payload
+        has_ship_info = "shipping_information" in payload
+
+        # Nécessite à la fois email + shipping_information
+        if not (has_email and has_ship_info):
+            return _error_missing_fields_order(
+                "Les informations client sont incomplètes ou manquantes"
+            )
+        if order.paid:
+            return _error_order_already_paid("La commande a déjà été payée.")
+
+        ship_info = payload["shipping_information"]
+        if not isinstance(ship_info, dict):
+            return _error_missing_fields_order("Le format de shipping_information est invalide")
+        for field in ("country", "address", "postal_code", "city", "province"):
+            if field not in ship_info:
+                return _error_missing_fields_order(
+                    "Les informations client sont incomplètes ou manquantes"
+                )
+
+        # Mettre à jour en base
+        order.email = payload["email"]
+        order.shipping_country = ship_info["country"]
+        order.shipping_address = ship_info["address"]
+        order.shipping_postal_code = ship_info["postal_code"]
+        order.shipping_city = ship_info["city"]
+        order.shipping_province = ship_info["province"]
+        order.save()
+
+        return jsonify({
+            "order": {
+                "id": order.id,
+                "total_price": order.total_price,
+                "total_price_tax": order.total_price_tax,
+                "email": order.email,
+                "shipping_information": {
+                    "country": order.shipping_country,
+                    "address": order.shipping_address,
+                    "postal_code": order.shipping_postal_code,
+                    "city": order.shipping_city,
+                    "province": order.shipping_province
+                },
+                "paid": order.paid,
+                "credit_card": json.loads(order.credit_card),
+                "transaction": json.loads(order.transaction),
+                "product": {
+                    "id": order.product.id,
+                    "name": order.product.name
+                },
+                "quantity": order.quantity,
+                "shipping_price": order.shipping_price
             }
-        }), 404)
+        }), 200
 
-    # 2) Vérifier que c'est du JSON
-    if not request.is_json:
-        return make_response(jsonify({
-            "errors": {
-                "order": {
-                    "code": "missing-fields",
-                    "name": "Le format doit être application/json"
-                }
-            }
-        }), 422)
+    # Cas 2 : paiement par carte (payload = { "credit_card": { ... } })
+    if "credit_card" in data:
+        cc_obj = data["credit_card"]
+        if not isinstance(cc_obj, dict):
+            return _error_missing_fields_order("Corps credit_card invalide")
 
-    payload = request.get_json()
+        # Vérifier que les infos client existent déjà en base
+        required = (
+            order.email,
+            order.shipping_country,
+            order.shipping_address,
+            order.shipping_postal_code,
+            order.shipping_city,
+            order.shipping_province
+        )
+        if any(val is None for val in required):
+            return _error_missing_fields_order(
+                "Les informations du client sont nécessaires avant d'appliquer une carte de crédit"
+            )
+        if order.paid:
+            return _error_order_already_paid("La commande a déjà été payée.")
 
-    # 3) Vérifier présence de "order"
-    if "order" not in payload or not isinstance(payload["order"], dict):
-        return make_response(jsonify({
-            "errors": {
-                "order": {
-                    "code": "missing-fields",
-                    "name": "Les champs 'email' et 'shipping_information' sont obligatoires"
-                }
-            }
-        }), 422)
+        montant = int(round(order.total_price_tax + order.shipping_price))
+        pay_payload = {
+            "credit_card": cc_obj,
+            "amount_charged": montant
+        }
 
-    order_obj = payload["order"]
-
-    # 4) Vérifier que "email" et "shipping_information" sont présents
-    if "email" not in order_obj or "shipping_information" not in order_obj:
-        return make_response(jsonify({
-            "errors": {
-                "order": {
-                    "code": "missing-fields",
-                    "name": "Les champs 'email' et 'shipping_information' sont obligatoires"
-                }
-            }
-        }), 422)
-
-    # 5) Valider email
-    email = order_obj["email"]
-    if not isinstance(email, str) or email.strip() == "":
-        return make_response(jsonify({
-            "errors": {
-                "order": {
-                    "code": "missing-fields",
-                    "name": "Le champ 'email' doit être une chaîne non vide"
-                }
-            }
-        }), 422)
-
-    # 6) Valider shipping_information (doit être un dict avec 5 sous-champs)
-    ship_info = order_obj["shipping_information"]
-    expected_fields = ["country", "address", "postal_code", "city", "province"]
-    if (not isinstance(ship_info, dict)) or any(f not in ship_info for f in expected_fields):
-        return make_response(jsonify({
-            "errors": {
-                "order": {
-                    "code": "missing-fields",
-                    "name": "shipping_information doit contenir country, address, postal_code, city et province"
-                }
-            }
-        }), 422)
-
-    # 7) Extraire et valider chacun des sous-champs
-    country = ship_info["country"]
-    address = ship_info["address"]
-    postal_code = ship_info["postal_code"]
-    city = ship_info["city"]
-    province = ship_info["province"]
-
-    # Tous doivent être des chaînes non vides
-    for field_name, val in [
-        ("country", country),
-        ("address", address),
-        ("postal_code", postal_code),
-        ("city", city),
-        ("province", province)
-    ]:
-        if not isinstance(val, str) or val.strip() == "":
-            return make_response(jsonify({
+        try:
+            pay_response = requests.post(
+                REMOTE_PAY_URL,
+                json=pay_payload,
+                headers={"Content-Type": "application/json"}
+            )
+        except requests.RequestException:
+            return jsonify({
                 "errors": {
-                    "order": {
-                        "code": "missing-fields",
-                        "name": f"Le champ '{field_name}' dans shipping_information est obligatoire"
+                    "payment": {
+                        "code": "service-unavailable",
+                        "name": "Impossible de contacter le service de paiement"
                     }
                 }
-            }), 422)
+            }), 502
 
-    # 8) Vérifier que province est dans notre liste de taux
-    if province not in TAX_BY_PROVINCE:
-        return make_response(jsonify({
-            "errors": {
+        if pay_response.status_code == 422:
+            return pay_response.json(), 422
+
+        if pay_response.status_code == 200:
+            resp_json = pay_response.json()
+            received_cc = resp_json.get("credit_card", {})
+            received_tx = resp_json.get("transaction", {})
+
+            order.credit_card = json.dumps(received_cc)
+            order.transaction = json.dumps(received_tx)
+            order.paid = True
+            order.save()
+
+            return jsonify({
                 "order": {
-                    "code": "invalid-field",
-                    "name": f"Province '{province}' non supportée pour calcul de taxes"
+                    "id": order.id,
+                    "total_price": order.total_price,
+                    "total_price_tax": order.total_price_tax,
+                    "email": order.email,
+                    "shipping_information": {
+                        "country": order.shipping_country,
+                        "address": order.shipping_address,
+                        "postal_code": order.shipping_postal_code,
+                        "city": order.shipping_city,
+                        "province": order.shipping_province
+                    },
+                    "paid": order.paid,
+                    "credit_card": received_cc,
+                    "transaction": received_tx,
+                    "product": {
+                        "id": order.product.id,
+                        "name": order.product.name
+                    },
+                    "quantity": order.quantity,
+                    "shipping_price": order.shipping_price
+                }
+            }), 200
+
+        return jsonify({
+            "errors": {
+                "payment": {
+                    "code": "service-error",
+                    "name": "Erreur inattendue du service de paiement"
                 }
             }
-        }), 422)
+        }), 502
 
-    # 9) Mettre à jour email + shipping_* dans l'objet Order
-    order.email = email
-    order.shipping_country = country
-    order.shipping_address = address
-    order.shipping_postal_code = postal_code
-    order.shipping_city = city
-    order.shipping_province = province
+    # Ni "order" ni "credit_card" → 422 missing-fields
+    return _error_missing_fields_order(
+        "Aucune information valide fournie pour la mise à jour ou le paiement"
+    )
 
-    # 10) Recalculer total_price_tax selon le taux de la province
-    taux = TAX_BY_PROVINCE[province]
-    new_total_ttc = round(order.total_price * (1 + taux), 2)
-    order.total_price_tax = new_total_ttc
+# ——— Fonctions utilitaires pour générer les erreurs 422 ———
 
-    # Remarque : shipping_price ne change pas ici (basé sur le poids qui n’évolue pas).
-    # Les autres champs (product, quantity, total_price, paid, credit_card, transaction, id) 
-    # ne sont pas modifiables via ce PUT.
-
-    # 11) Sauvegarder l'objet order
-    order.save()
-
-    # 12) Construire la réponse JSON complète comme demandé
-    shipping_info_resp = {
-        "country": order.shipping_country,
-        "address": order.shipping_address,
-        "postal_code": order.shipping_postal_code,
-        "city": order.shipping_city,
-        "province": order.shipping_province
+def _error_missing_fields_order(message: str):
+    """
+    Retourne un 422 Unprocessable Entity pour le cas 'missing-fields' (Order).
+    """
+    payload = {
+        "errors": {
+            "order": {
+                "code": "missing-fields",
+                "name": message
+            }
+        }
     }
+    return jsonify(payload), 422
 
-    try:
-        cc_json = json.loads(order.credit_card)
-    except:
-        cc_json = {}
-    try:
-        tx_json = json.loads(order.transaction)
-    except:
-        tx_json = {}
-
-    response_order = {
-        "id": order.id,
-        "total_price": order.total_price,
-        "total_price_tax": order.total_price_tax,
-        "email": order.email,
-        "credit_card": cc_json,
-        "shipping_information": shipping_info_resp,
-        "paid": order.paid,
-        "transaction": tx_json,
-        "product": {
-            "id": order.product.id,
-            "quantity": order.quantity
-        },
-        "shipping_price": order.shipping_price
+def _error_order_already_paid(message: str):
+    """
+    Retourne un 422 Unprocessable Entity pour le cas 'already-paid'.
+    """
+    payload = {
+        "errors": {
+            "order": {
+                "code": "already-paid",
+                "name": message
+            }
+        }
     }
-
-    return jsonify({"order": response_order}), 200
-
+    return jsonify(payload), 422
 
 if __name__ == '__main__':
     init_database()
